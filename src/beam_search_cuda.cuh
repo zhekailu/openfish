@@ -3,6 +3,9 @@
 
 #include "decode.h"
 
+// threads per chunk for compute_qual_data and generate_sequence
+#define GEN_THREADS (128)
+
 // #include <cstddef>
 // #include <cstdint>
 

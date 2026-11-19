@@ -61,13 +61,23 @@ __global__ void generate_sequence(
     const float shift,
     const float scale
 ) {
-    const uint64_t chunk = blockIdx.x + (blockIdx.y * gridDim.x);
+    // Parallel form of the serial loop. Timestep b emits emit(b) = (b == 0 ? 1 : moves[b]) bases,
+    // starting at the exclusive prefix sum of emit. The probabilities of one output base are summed
+    // over a run of timesteps: the step that emitted it, then the stays that follow it. Each thread
+    // owns a contiguous range of timesteps; the thread whose range holds a run's first timestep sums
+    // the whole run, in timestep order and starting from 0, exactly as the serial loop accumulates
+    // it, so every value is identical. Launched with GEN_THREADS threads per chunk.
+    __shared__ int seg_start[GEN_THREADS];
+    __shared__ int emitted;
 
+    const uint64_t chunk = blockIdx.x + (blockIdx.y * gridDim.x);
     if (chunk >= args.N) {
 		return;
 	}
 
-    const uint64_t T = args.T;
+    const int T = (int)args.T;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
     const uint8_t *moves = _moves + chunk * T;
     const state_t *states = _states + chunk * T;
     const float *qual_data = _qual_data + chunk * T * NUM_BASES;
@@ -76,42 +86,63 @@ __global__ void generate_sequence(
     char *sequence = _sequence + chunk * T;
     char *qstring = _qstring + chunk * T;
 
-    size_t seq_len = 0;
-    for (size_t i = 0; i < T; ++i) {
-        seq_len += moves[i];
+    for (int i = tid; i < T; i += nt) {
         base_probs[i] = 0.0f;
         total_probs[i] = 0.0f;
     }
 
-    size_t seq_pos = 0;
+    // exclusive prefix sum of emitted bases: each thread counts its range, thread 0 scans the counts
+    const int seg = (T + nt - 1) / nt;
+    const int b0 = min(T, tid * seg);
+    const int b1 = min(T, b0 + seg);
+    int count = 0;
+    for (int b = b0; b < b1; ++b) count += (b == 0) ? 1 : (int)moves[b];
+    seg_start[tid] = count;
+    __syncthreads();
+    if (tid == 0) {
+        int acc = 0;
+        for (int t = 0; t < nt; ++t) {
+            const int v = seg_start[t];
+            seg_start[t] = acc;
+            acc += v;
+        }
+        emitted = acc;
+    }
+    __syncthreads();
+
+    int pos = seg_start[tid];
+    for (int b = b0; b < b1; ++b) {
+        const int move = (int)moves[b];
+        const int emit = (b == 0) ? 1 : move;
+        const int base = states[b] & 3;
+        for (int j = 0; j < emit; ++j) {
+            sequence[pos + j] = (char)base;
+        }
+        if (emit > 0) {
+            // this timestep starts a run: itself, then the stays that follow it
+            const int prob_pos = pos + ((b == 0) ? 0 : move - 1);
+            float bp = 0.0f;
+            float tp = 0.0f;
+            int j = b;
+            do {
+                bp += qual_data[j * NUM_BASES + (states[j] & 3)];
+                for (int k = 0; k < NUM_BASES; ++k) {
+                    tp += qual_data[j * NUM_BASES + k];
+                }
+                ++j;
+            } while (j < T && moves[j] == 0);
+            base_probs[prob_pos] = bp;
+            total_probs[prob_pos] = tp;
+        }
+        pos += emit;
+    }
+    __syncthreads();
+
+    // seq_len as the serial loop computes it: the sum of moves (moves[0] is always 1)
+    const int seq_len = emitted - 1 + (int)moves[0];
 
     const char alphabet[4] = {'A', 'C', 'G', 'T'};
-    
-    for (size_t blk = 0; blk < T; ++blk) {
-        int state = states[blk];
-        int move = (int)moves[blk];
-        int base = state & 3;
-        int offset = (blk == 0) ? 0 : move - 1;
-        int probPos = (int)(seq_pos + offset);
-
-        // get the probability for the called base.
-        base_probs[probPos] += qual_data[blk * NUM_BASES + base];
-
-        // accumulate the total probability for all possible bases at this position, for normalization.
-        for (size_t k = 0; k < NUM_BASES; ++k) {
-            total_probs[probPos] += qual_data[blk * NUM_BASES + k];
-        }
-
-        if (blk == 0) {
-            sequence[seq_pos++] = (char)base;
-        } else {
-            for (int j = 0; j < move; ++j) {
-                sequence[seq_pos++] = (char)base;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < seq_len; ++i) {
+    for (int i = tid; i < seq_len; i += nt) {
         sequence[i] = alphabet[(int)sequence[i]];
         base_probs[i] = 1.0f - (base_probs[i] / total_probs[i]);
         base_probs[i] = -10.0f * __log10f(base_probs[i]);
@@ -148,7 +179,8 @@ __global__ void beam_search(
 ) {
     const uint64_t chunk = blockIdx.x + (blockIdx.y * gridDim.x);
     const uint64_t tid = threadIdx.x + (threadIdx.y * blockDim.x);
-    const uint64_t nthreads = MAX_BEAM_WIDTH * NUM_BASES;
+    // launched with roundup32(beam_width * NUM_BASES) threads: one per candidate step, whole warps
+    const uint64_t nthreads = blockDim.x * blockDim.y;
     const int lane_id = tid % warpSize;
     const int warp_id = tid / warpSize;
     const unsigned mask = 0xFFFFFFFFU;
@@ -191,7 +223,8 @@ __global__ void beam_search(
 
     // a k=1 Bloom filter, indicating the presence of steps with particular sequence hashes
     // avoids comparing stay hashes against all possible progenitor states where none of them has the requisite sequence hash
-    __shared__ bool step_hash_present[HASH_PRESENT_BITS];
+    // as a bit mask, so resetting it every timestep is one word per thread
+    __shared__ uint32_t step_hash_present[HASH_PRESENT_BITS / 32];
 
     __shared__ size_t current_beam_width;
     __shared__ float beam_init_threshold;
@@ -264,8 +297,8 @@ __global__ void beam_search(
         }
         
         // reset bloom filter
-        for (uint32_t i = tid; i < HASH_PRESENT_BITS; i += nthreads) {
-            step_hash_present[i] = false;
+        for (uint32_t i = tid; i < HASH_PRESENT_BITS / 32; i += nthreads) {
+            step_hash_present[i] = 0u;
         }
         __syncthreads();
         
@@ -302,7 +335,7 @@ __global__ void beam_search(
 
             // generate hash from previous element and new state
             uint32_t new_hash = crc32c(previous_element->hash, new_base, NUM_BASE_BITS);
-            step_hash_present[new_hash & HASH_PRESENT_MASK] = true;
+            atomicOr(&step_hash_present[(new_hash & HASH_PRESENT_MASK) >> 5], 1u << (new_hash & 31));
 
             uint32_t new_elem_idx = new_elem_count + (prev_elem_idx * NUM_BASES) + new_base;
 
@@ -373,7 +406,7 @@ __global__ void beam_search(
 
             // determine whether the path including this stay duplicates another sequence ending in a step equal to the state of the stay
             // this "bloom filter" is supposed to help avoid comparing hash against every single step generated before
-            if (step_hash_present[previous_element->hash & HASH_PRESENT_MASK]) {
+            if (step_hash_present[(previous_element->hash & HASH_PRESENT_MASK) >> 5] & (1u << (previous_element->hash & 31))) {
                 // left shift by 2 and then add the previous elem idx
                 size_t stay_elem_idx = (current_beam_width << NUM_BASE_BITS) + prev_elem_idx;
 
@@ -586,8 +619,8 @@ __global__ void compute_qual_data(
 
     int shifted_states[2 * NUM_BASES];
 
-    // compute per-base qual data
-    for (size_t block_idx = 0; block_idx < T; ++block_idx) {
+    // compute per-base qual data; timesteps are independent (each reads and rewrites only its own state)
+    for (size_t block_idx = threadIdx.x; block_idx < T; block_idx += blockDim.x) {
         int state = states[block_idx];
         states[block_idx] = states[block_idx] % NUM_BASES;
         int base_to_emit = states[block_idx];

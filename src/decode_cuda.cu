@@ -100,8 +100,13 @@ void decode_cuda(
     OPENFISH_LOG_TRACE("chosen block_dims: %d x %d for num_states %d", block_width, block_width, num_states);
     
     dim3 block_size(block_width, block_width, 1);
-    dim3 block_size_beam(MAX_BEAM_WIDTH * NUM_BASES, 1, 1);
-    dim3 block_size_gen(1, 1, 1);
+    // beam search: one thread per candidate step, rounded up to whole warps (the kernel's warp
+    // reductions assume full warps); every loop in the kernel strides by the block size
+    int beam_threads = (int)(options->beam_width * NUM_BASES);
+    beam_threads = ((beam_threads + 31) / 32) * 32;
+    if (beam_threads > MAX_BEAM_WIDTH * NUM_BASES) beam_threads = MAX_BEAM_WIDTH * NUM_BASES;
+    dim3 block_size_beam(beam_threads, 1, 1);
+    dim3 block_size_gen(GEN_THREADS, 1, 1);
 	dim3 grid_size(N, 1, 1);
 
     // dynamic shared memory sized by num_states rather than MAX_STATES
