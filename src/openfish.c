@@ -74,6 +74,51 @@ void openfish_decode_gpu(
 #endif
 }
 
+void openfish_scan_gpu(
+    const int T,
+    const int N,
+    const int C,
+    void *scores_TNC,
+    const int state_len,
+    const openfish_opt_t *options,
+    float *bwd_NTC,
+    float *post_NTC
+) {
+#ifdef HAVE_CUDA
+    scan_cuda(T, N, C, scores_TNC, state_len, options, bwd_NTC, post_NTC);
+#else
+    (void)T; (void)N; (void)C; (void)scores_TNC; (void)state_len; (void)options; (void)bwd_NTC; (void)post_NTC;
+    OPENFISH_ERROR("%s", "openfish_scan_gpu: not compiled for cuda");
+    exit(EXIT_FAILURE);
+#endif
+}
+
+void *openfish_host_alloc(size_t bytes, void **device_ptr) {
+#ifdef HAVE_CUDA
+    return host_alloc_cuda(bytes, device_ptr);
+#else
+    (void)bytes;
+    *device_ptr = NULL;
+    return NULL;
+#endif
+}
+
+void openfish_host_free(void *host_ptr) {
+#ifdef HAVE_CUDA
+    host_free_cuda(host_ptr);
+#else
+    (void)host_ptr;
+#endif
+}
+
+int openfish_gpu_is_integrated(void) {
+#ifdef HAVE_CUDA
+    return gpu_is_integrated_cuda();
+#else
+    return 0;
+#endif
+}
+
 void openfish_rotary_emb_gpu(
     void *x_gpu,
     void *sin_gpu,

@@ -32,6 +32,21 @@ void decode_cuda(
     char **qstring
 );
 
+void scan_cuda(
+    const int T,
+    const int N,
+    const int C,
+    void *scores_TNC,
+    const int state_len,
+    const openfish_opt_t *options,
+    float *bwd_NTC,
+    float *post_NTC
+);
+
+void *host_alloc_cuda(size_t bytes, void **device_ptr);
+void host_free_cuda(void *host_ptr);
+int gpu_is_integrated_cuda(void);
+
 void set_device_cuda(
     int device
 );

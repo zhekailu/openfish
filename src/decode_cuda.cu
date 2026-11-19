@@ -221,6 +221,72 @@ void decode_cuda(
     checkCudaError();
 }
 
+// the scans of decode_cuda only (same kernels, launch shapes and order), into caller buffers
+void scan_cuda(
+    const int T,
+    const int N,
+    const int C,
+    void *scores_TNC,
+    const int state_len,
+    const openfish_opt_t *options,
+    float *bwd_NTC,
+    float *post_NTC
+) {
+    const int num_states = pow(NUM_BASES, state_len);
+    const int target_block_width = (int)ceil(sqrt((float)num_states));
+    int block_width = 2;
+    while (block_width < target_block_width) {
+        block_width *= 2;
+    }
+    dim3 block_size(block_width, block_width, 1);
+    dim3 grid_size(N, 1, 1);
+    const size_t fwd_post_smem = sizeof(float) * 2 * num_states; // ts_fwd[2]
+
+    scan_args_t scan_args = {0};
+    scan_args.scores_in = scores_TNC;
+    scan_args.T = T;
+    scan_args.N = N;
+    scan_args.C = C;
+    scan_args.num_states = num_states;
+    scan_args.fixed_stay_score = options->blank_score;
+
+    OPENFISH_LOG_TRACE("%s", "bwd scan...");
+    bwd_scan<<<grid_size,block_size>>>(scan_args, bwd_NTC);
+    checkCudaError();
+    OPENFISH_LOG_TRACE("%s", "fwd + post scan...");
+    fwd_post_scan<<<grid_size,block_size,fwd_post_smem>>>(scan_args, bwd_NTC, post_NTC);
+    checkCudaError();
+    cudaDeviceSynchronize();
+    checkCudaError();
+}
+
+void *host_alloc_cuda(size_t bytes, void **device_ptr) {
+    void *host = NULL;
+    *device_ptr = NULL;
+    if (cudaHostAlloc(&host, bytes, cudaHostAllocMapped) != cudaSuccess) {
+        cudaGetLastError(); // clear the error: the caller handles NULL
+        return NULL;
+    }
+    if (cudaHostGetDevicePointer(device_ptr, host, 0) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFreeHost(host);
+        *device_ptr = NULL;
+        return NULL;
+    }
+    return host;
+}
+
+void host_free_cuda(void *host_ptr) {
+    if (host_ptr) cudaFreeHost(host_ptr);
+}
+
+int gpu_is_integrated_cuda(void) {
+    int dev = 0, integrated = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return 0; }
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) { cudaGetLastError(); return 0; }
+    return integrated;
+}
+
 // misc stuff for testing //////////////////////////////////////////////////////
 void set_device_cuda(
     int device

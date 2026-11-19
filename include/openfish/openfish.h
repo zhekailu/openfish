@@ -93,6 +93,51 @@ void openfish_decode_gpu(
     char **qstring
 );
 
+/* Split decode, for running the beam search on the CPU while the GPU works on the next batch.
+ *
+ * openfish_scan_gpu: the backward scan and the forward scan + posterior of openfish_decode_gpu, and
+ * nothing else. scores_TNC is fp16 [T][N][C]; bwd_NTC and post_NTC receive N * (T + 1) * num_states
+ * floats each. All three must be device-accessible; on an integrated GPU (Jetson) they can live in
+ * pinned host memory from openfish_host_alloc, so the CPU then reads them without a copy.
+ * Synchronises before returning. */
+void openfish_scan_gpu(
+    const int T,
+    const int N,
+    const int C,
+    void *scores_TNC,
+    const int state_len,
+    const openfish_opt_t *options,
+    float *bwd_NTC,
+    float *post_NTC
+);
+
+/* openfish_scan_gpu's other half: beam search, per-base qualities and sequence on the CPU, from
+ * fp16 scores and the scan outputs (same layouts as above), over nthreads threads. Output as for
+ * openfish_decode_cpu (moves, sequence, qstring: N * T each, caller frees). */
+void openfish_beam_cpu_fp16(
+    const int T,
+    const int N,
+    const int C,
+    int nthreads,
+    const void *scores_TNC,
+    const float *bwd_NTC,
+    const float *post_NTC,
+    const int state_len,
+    const openfish_opt_t *options,
+    uint8_t **moves,
+    char **sequence,
+    char **qstring
+);
+
+/* Pinned host memory mapped into the GPU's address space (cudaHostAllocMapped). Returns the host
+ * pointer, or NULL on failure; *device_ptr receives the pointer GPU kernels use. */
+void *openfish_host_alloc(size_t bytes, void **device_ptr);
+void openfish_host_free(void *host_ptr);
+
+/* 1 if the GPU shares physical memory with the CPU (Jetson), so zero-copy buffers run at full speed;
+ * 0 for a discrete GPU, where every GPU access to them crosses PCIe. */
+int openfish_gpu_is_integrated(void);
+
 openfish_gpubuf_t *openfish_gpubuf_init(
     const int T,
     const int N,
